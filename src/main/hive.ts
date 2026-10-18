@@ -21,7 +21,7 @@
 import { WEB_SETTINGS_UNREADABLE, WEB_TOOLS, type SandboxNetwork } from '../shared/webAccess';
 import {
   addressedToResearch, ANSWER_UNCHECKED, ANSWER_UNCHECKED_SUBJECT, hasAttachments, looksLikeInjection, NOT_SENT_SUBJECT,
-  PRIVACY_CHECK_SENDER, REFUSAL_CHECK_FAILED, REFUSAL_FILES, REFUSAL_OFF, RESEARCH_HOUSE_RULE, RESEARCH_ID, RESEARCH_REPLY_LABEL,
+  PRIVACY_CHECK_SENDER, REFUSAL_CHECK_FAILED, REFUSAL_FILES, REFUSAL_NOT_DELIVERED, REFUSAL_OFF, RESEARCH_HOUSE_RULE, RESEARCH_ID, RESEARCH_REPLY_LABEL,
   RESEARCH_UNCHECKED_TOOL, NOT_SENT_SUBJECT_OUT, RESEARCH_ONLY_ASKERS, RESEARCH_NAME, RESEARCH_ROLE, isReservedName,
   SENT_AS_SUBJECT, sentAsBody, nameKey, researchText, cleanResearchName, RESEARCH_ONLY_SKILLS
 } from '../shared/research';
@@ -2545,7 +2545,7 @@ export class HiveManager {
     const what = from === 'human' ? 'A note from the owner'
       : from === 'system' ? 'A message from the app'
         : `${reg.agents[from]?.name?.trim() || from}'s message`;
-    const next = reason === REFUSAL_CHECK_FAILED
+    const next = reason === REFUSAL_CHECK_FAILED || reason === REFUSAL_NOT_DELIVERED
       ? 'This is an app problem. If it keeps happening, tell the owner.'
       : reason === REFUSAL_OFF
         ? `The owner turns ${n} on in Settings, Research & privacy.`
@@ -2633,7 +2633,7 @@ export class HiveManager {
       return;
     }
     this.researchQueued++;
-    // Kept in the app's private folder while its check runs, so a crash in
+    // Kept in the app's private folder until it is delivered, so a crash in
     // between is told to Michael at the next start, not lost (Codex review).
     if (!fromAgent) this.researchPending(msg, true);
     const refuse = (reason: string, why?: string): void => {
@@ -2642,20 +2642,48 @@ export class HiveManager {
     };
     const layer = this.trustLayer;
     const policy = this.policyOf(layer);
-    layer.inbound({ subject: msg.subject, body: msg.body }).then((v) => {
-      this.researchQueued--;
-      if (!fromAgent) this.researchPending(msg, false);
+    // The clean copy keeps one id on every try, so a try cut short after its
+    // write finds it with Research and never sends it twice.
+    const copyId = `${stamp()}-${shortRand()}`;
+    let tries = 0;
+    let told = false;
+    const settle = (v: InboundVerdict): void => {
       try {
+        // A try cut short after its write already reached Research: only
+        // what comes after the write is left to do.
+        const landed = tries > 0 && this.researchHas(copyId);
         // The owner changed what stays private while it was checked: checked
         // again under the new settings (Codex review, third ship).
-        if (this.policyOf(layer) !== policy) { this.queueForResearch(msg); return; }
-        if (v.decision === 'deny') return refuse(v.reason);
+        if (!landed && this.policyOf(layer) !== policy) {
+          if (!fromAgent) this.researchPending(msg, false);
+          this.queueForResearch(msg);
+          return;
+        }
+        if (v.decision === 'deny') refuse(v.reason);
         // Research may have been turned off while the check ran.
-        if (!this.researchOn()) return refuse(REFUSAL_OFF, 'research-off');
-        this.deliverToResearch(msg.from, msg, v.subject, v.body);
-        if (v.decision === 'clean' && fromAgent) this.tellSender(msg.from, msg.id, msg.conversation, SENT_AS_SUBJECT, sentAsBody(v.subject, v.body, this.researchName()), true);
-        this.commit('hive: trust layer delivered to research');
-      } catch (e) { console.error('[research] delivering a checked message', e); }
+        else if (!landed && !this.researchOn()) refuse(REFUSAL_OFF, 'research-off');
+        else {
+          tries++;
+          if (!landed) this.deliverToResearch(msg.from, msg, v.subject, v.body, copyId);
+          if (!told && v.decision === 'clean' && fromAgent) {
+            this.tellSender(msg.from, msg.id, msg.conversation, SENT_AS_SUBJECT, sentAsBody(v.subject, v.body, this.researchName()), true);
+            told = true;
+          }
+          this.commit('hive: trust layer delivered to research');
+        }
+      } catch (e) {
+        console.error('[research] delivering a checked message', e);
+        // A failed delivery keeps its row and is tried again on the next
+        // routing passes; after the last try the sender and Michael hear it
+        // was not sent, once (Codex review, mit/named-links ship).
+        if (tries && tries < HiveManager.RESEARCH_DELIVERY_TRIES) { this.researchRetries.set(msg.id, () => settle(v)); return; }
+        if (tries) try { refuse(REFUSAL_NOT_DELIVERED, 'not-delivered'); } catch { /* logged above */ }
+      }
+      if (!fromAgent) this.researchPending(msg, false);
+    };
+    layer.inbound({ subject: msg.subject, body: msg.body }).then((v) => {
+      this.researchQueued--;
+      settle(v);
     }, () => {
       this.researchQueued--;
       if (!fromAgent) this.researchPending(msg, false);
@@ -2663,8 +2691,8 @@ export class HiveManager {
     });
   }
 
-  /** The owner's and the app's messages for Research whose check is under
-   *  way, by id: what they were and who sent them, nothing more. */
+  /** The owner's and the app's messages for Research not yet delivered, by
+   *  id: what they were and who sent them, nothing more. */
   private researchPending(msg: HiveMessage, add: boolean): void {
     // Anything left from before this start is told first, never this run's.
     this.tellLostResearchPending();
@@ -2730,10 +2758,19 @@ export class HiveManager {
   /** This run's own notes under check, and the lost ones already told. */
   private readonly researchPendingMine = new Set<string>();
   private readonly researchLostTold = new Set<string>();
+  /** Checked messages for Research whose delivery failed, by id: each is
+   *  tried again on the next routing pass, up to RESEARCH_DELIVERY_TRIES in all. */
+  private readonly researchRetries = new Map<string, () => void>();
+  static readonly RESEARCH_DELIVERY_TRIES = 5;
+
+  /** The app's copy by this id is with Research, unread or handled. */
+  private researchHas(id: string): boolean {
+    return [this.researchDir('inbox'), this.researchDir('inbox', '.done')].some((d) => !!d && existsSync(join(d, `${id}.json`)));
+  }
 
   /** The clean copy Research receives: built only from what the trust layer
    *  returned, with an id, time and thread the app chose. */
-  private deliverToResearch(fromId: string, orig: HiveMessage, subject: string, body: string): void {
+  private deliverToResearch(fromId: string, orig: HiveMessage, subject: string, body: string, id?: string): void {
     // Research answers questions; it is never assigned work, so a request
     // reaches it as a query (a request would go to Michael as a teammate's
     // job hand off). The thread is an HMAC of the sender and the sender's
@@ -2741,7 +2778,7 @@ export class HiveManager {
     // without the sender's thread id, which the trust layer never read.
     const act: MessageAct = orig.act === 'inform' ? 'inform' : 'query';
     const thread = `conv-r-${createHmac('sha256', this.researchKey()).update(`thread\n${fromId}\n${orig.conversation}`).digest('hex').slice(0, 16)}`;
-    const clean = this.normalize({ to: RESEARCH_ID, act, subject, body, conversation: thread }, fromId);
+    const clean = this.normalize({ id, to: RESEARCH_ID, act, subject, body, conversation: thread }, fromId);
     const back = { origId: orig.id, conversation: orig.conversation, from: fromId };
     this.researchThreads.set(clean.id, back);
     this.researchThreads.set(clean.conversation, back);
@@ -2840,9 +2877,10 @@ export class HiveManager {
   }
 
   /** Asks waiting for Research: delivered and not yet read, plus those in a
-   *  check. Turning Research off sends these back (design review D7). */
+   *  check or waiting for another try. Turning Research off sends these back
+   *  (design review D7). */
   researchWaiting(): number {
-    let n = this.researchQueued;
+    let n = this.researchQueued + this.researchRetries.size;
     for (const [k, c] of this.trustChecks) if (k.startsWith('in:') && !c.done) n++;
     // Only what the app delivered counts.
     n += this.listMessages(join(this.agentDir(RESEARCH_ID), 'inbox')).length;
@@ -3207,6 +3245,11 @@ export class HiveManager {
     const researchOn = this.researchOn();
     try { this.tellLostResearchPending(); } catch { /* next start */ }
     try { this.sweepResearchInbox(researchOn); } catch { /* next tick */ }
+    // A checked message whose delivery failed gets its next try.
+    for (const [id, retry] of [...this.researchRetries]) {
+      this.researchRetries.delete(id);
+      try { retry(); } catch { /* its row stays: told at the next start */ }
+    }
     this.pruneTrustChecks();
     // Read once per tick, when the first message needs them, not once per file.
     let reg: Registry | undefined;

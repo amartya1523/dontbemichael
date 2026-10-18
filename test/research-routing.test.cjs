@@ -703,6 +703,67 @@ test('an owner note whose check finished leaves nothing pending', async (t) => {
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), []);
 });
 
+const pendingRows = (hive) => JSON.parse(fs.readFileSync(path.join(path.dirname(hive.root()), 'private', 'research-pending.json'), 'utf8'));
+
+test('a checked owner note Pete\'s inbox can\'t take keeps its row and is delivered on the next pass', posixOnly('folder modes'), async (t) => {
+  // Value: protects=a disk error never drops an owner or app message for Pete; fails_when=the pending row goes before delivery, or a failed delivery is only logged; why_new=Codex adversarial review, mit/named-links ship (TODOS.md); seam=read only inbox
+  const { hive } = await office(t);
+  const inbox = path.join(hive.root(), 'agents', 'research', 'inbox');
+  fs.chmodSync(inbox, 0o555);
+  try {
+    hive.rememberOwnerNote('research', 'Focus on flour');
+    await tick();
+    assert.equal(msgsIn(hive, 'research').length, 0);
+    assert.equal(pendingRows(hive).length, 1, 'kept for the next try');
+    assert.equal(hive.researchWaiting(), 1, 'still counted as waiting');
+  } finally { fs.chmodSync(inbox, 0o755); }
+  hive.routeOnce();
+  const got = msgsIn(hive, 'research');
+  assert.equal(got.length, 1, 'delivered on the next pass');
+  assert.equal(got[0].body, 'Focus on flour');
+  assert.deepEqual(pendingRows(hive), [], 'removed once delivered');
+  hive.routeOnce();
+  assert.equal(msgsIn(hive, 'research').length, 1, 'delivered once');
+  assert.equal(notes(hive, 'god', R.NOT_SENT_SUBJECT).length, 0, 'nothing for Michael: it arrived');
+});
+
+test('a checked note that can\'t be delivered after every try is told to Michael once', posixOnly('folder modes'), async (t) => {
+  // Value: protects=Michael hears who sent what when it never reaches Pete, and only once; fails_when=a failed delivery is only logged, or Michael is told on every try; why_new=Codex adversarial review, mit/named-links ship (TODOS.md); seam=read only inbox
+  const { hive } = await office(t);
+  const inbox = path.join(hive.root(), 'agents', 'research', 'inbox');
+  fs.chmodSync(inbox, 0o555);
+  try {
+    hive.rememberOwnerNote('research', 'Focus on flour');
+    await tick();
+    for (let i = 0; i < HiveManager.RESEARCH_DELIVERY_TRIES + 2; i++) hive.routeOnce();
+  } finally { fs.chmodSync(inbox, 0o755); }
+  hive.routeOnce();
+  assert.equal(msgsIn(hive, 'research').length, 0, 'given up');
+  const told = notes(hive, 'god', R.NOT_SENT_SUBJECT);
+  assert.equal(told.length, 1, 'once, not on every try');
+  assert.match(told[0].body, /^A note from the owner for Pete \("A note from the owner"\) was not sent: it passed the privacy check, but the app could not deliver it\. .*This is an app problem\./);
+  assert.deepEqual(pendingRows(hive), [], 'nothing left to report again at the next start');
+});
+
+test('a try cut short after its write never gives Pete the note twice', async (t) => {
+  // Value: protects=a retry after a write that landed doesn't deliver again, even once Pete has handled it; fails_when=each try writes a new copy, or the row goes before the try finishes; why_new=Codex adversarial review, mit/named-links ship (TODOS.md); seam=a renderer event that throws
+  const { hive } = await office(t);
+  let fail = true;
+  hive.emit = (channel, p) => { if (fail && channel === 'hive:message' && p.to === 'research') { fail = false; throw new Error('window closed'); } };
+  hive.rememberOwnerNote('research', 'Focus on flour');
+  await tick();
+  const [copy] = msgsIn(hive, 'research');
+  assert.ok(copy, 'its write landed');
+  assert.equal(pendingRows(hive).length, 1, 'kept until the try finishes');
+  // Pete handles it before the next pass.
+  const inbox = path.join(hive.root(), 'agents', 'research', 'inbox');
+  fs.renameSync(path.join(inbox, `${copy.id}.json`), path.join(inbox, '.done', `${copy.id}.json`));
+  hive.routeOnce(); hive.routeOnce();
+  assert.equal(msgsIn(hive, 'research').length, 0, 'not delivered again');
+  assert.deepEqual(pendingRows(hive), []);
+  assert.equal(notes(hive, 'god', R.NOT_SENT_SUBJECT).length, 0);
+});
+
 test('the notice of a lost owner note waits until Michael\'s inbox takes it', async (t) => {
   // Value: protects=the only record of a note lost in a crash isn't dropped when Michael's inbox isn't there yet; fails_when=the pending file is deleted after a failed delivery; why_new=Codex adversarial review, second ship; seam=fake layer
   const layer = fakeLayer({ inbound: () => new Promise(() => {}) });
